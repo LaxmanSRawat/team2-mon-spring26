@@ -1,0 +1,114 @@
+language: minimal
+
+# Build stages run sequentially; jobs within a stage run in parallel.
+# Deploy stage is gated to pushes on main only.
+stages:
+  - lint
+  - test
+  - name: deploy
+    if: branch = main AND type = push
+
+jobs:
+  include:
+
+    # ── Lint ────────────────────────────────────────────────────────────────
+
+    - stage: lint
+      name: "Black – backend"
+      language: python
+      python: "3.12"
+      install: pip install black
+      script: black --check backend/
+
+    - stage: lint
+      name: "ESLint – frontend"
+      language: node_js
+      node_js: "20"
+      cache:
+        directories:
+          - frontend/node_modules
+      before_install: cd frontend
+      install: npm ci
+      script: npm run lint
+
+    # ── Test ────────────────────────────────────────────────────────────────
+
+    - stage: test
+      name: "Django tests + coverage"
+      language: python
+      python: "3.12"
+      cache: pip
+      install:
+        - pip install -r backend/requirements.txt
+        - pip install coverage coveralls
+      script:
+        - cd backend
+        - coverage run --source=accounts manage.py test tests/ -v 2
+      after_success: COVERALLS_PARALLEL=true coveralls
+
+    - stage: test
+      name: "Vitest + coverage"
+      language: node_js
+      node_js: "20"
+      cache:
+        directories:
+          - frontend/node_modules
+      before_install: cd frontend
+      install: npm ci
+      script: npm run test:coverage
+      after_success: cat coverage/lcov.info | COVERALLS_PARALLEL=true npx coveralls
+
+    # ── Deploy ──────────────────────────────────────────────────────────────
+    # Runs only when a commit is pushed / merged to main.
+    # AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) and
+    # COVERALLS_REPO_TOKEN must be set in Travis CI repository settings.
+
+    - stage: deploy
+      name: "Deploy backend → AWS EB"
+      language: python
+      python: "3.12"
+      install: pip install awsebcli
+      before_script:
+        - mkdir -p backend/.elasticbeanstalk
+        - |
+          cat > backend/.elasticbeanstalk/config.yml << 'EOF'
+          branch-defaults:
+            main:
+              environment: Mealswipe-backend-env-1
+          global:
+            application_name: Mealswipe-backend
+            default_platform: Python 3.14 running on 64bit Amazon Linux 2023
+            default_region: us-east-2
+          EOF
+      script: cd backend && eb deploy Mealswipe-backend-env-1 --timeout 10
+
+    - stage: deploy
+      name: "Build and deploy frontend → AWS EB"
+      language: node_js
+      node_js: "20"
+      cache:
+        directories:
+          - frontend/node_modules
+      before_install: cd frontend
+      install:
+        - npm ci
+        - pip3 install awsebcli
+      before_script:
+        - npm run build
+        - mkdir -p .elasticbeanstalk
+        - |
+          cat > .elasticbeanstalk/config.yml << 'EOF'
+          branch-defaults:
+            main:
+              environment: Mealswipe-frontend-1-env
+          global:
+            application_name: Mealswipe-frontend-1
+            default_platform: Node.js 24 running on 64bit Amazon Linux 2023
+            default_region: us-east-2
+          EOF
+      script: eb deploy Mealswipe-frontend-1-env --timeout 10
+
+# Notify Coveralls to finalise the parallel coverage build once all jobs
+# in this build have reported. Travis calls this webhook automatically.
+notifications:
+  webhooks: https://coveralls.io/webhook
